@@ -1,92 +1,118 @@
-# Typst Throughput Renderer
+# Typst Concurrent Renderer
 
-A high-throughput, concurrent Go rendering pipeline designed to compile Typst source code into PDF bytes at maximum CPU saturation.
+A small Go renderer that turns Typst source strings into PDF bytes.
 
-The focus of this project is raw speed: taking advantage of Typst's natively fast, Rust-backed compiler and scaling it horizontally across multi-core systems using Go's concurrency primitives.
+It runs several `typst compile - -` commands at the same time, so one machine can render many PDFs faster than a single Typst CLI process.
 
-## Motivation & Problem Solved
+## Why this exists
 
-Typst was specifically chosen for its exceptional compilation speed (capable of generating massive documents in fractions of a second). However, as a CLI tool, it operates sequentially.
+Typst is fast, but the CLI handles one compile at a time.
 
-This project solves the concurrency bottleneck for high-volume document generation. By wrapping the Typst binary in a bounded Go worker pool with buffered channels, this pipeline allows a single machine to orchestrate hundreds of isolated compilation processes simultaneously, achieving predictable, stress-tested throughput without overwhelming the host OS.
+If your app needs to generate many PDFs, you usually want to keep all CPU cores busy. This project does that with a fixed worker pool. Each worker receives Typst source, runs the Typst CLI, and sends back either PDF bytes or an error.
 
-## What this project does
+## What it does
 
-- Ingests raw Typst source code as strings via an input channel.
-- Spawns and manages a bounded goroutine worker pool optimized to `runtime.NumCPU()`.
-- Orchestrates concurrent, isolated `os/exec` subprocesses (`typst compile - -`) through `exec.CommandContext`.
-- Applies per-render process deadlines so stuck Typst compilations are killed instead of hanging workers forever.
-- Streams binary PDF outputs and isolated error states through dedicated channels.
+- Accepts Typst source as a string.
+- Runs a fixed number of workers.
+- Calls `typst compile - -` for each render.
+- Uses a timeout so a stuck render does not block a worker forever.
+- Sends successful PDF bytes to `OutputChan`.
+- Sends render errors to `ErrorChan`.
 
-## Architecture & Data Flow
+## Flow
 
 ```mermaid
 flowchart TD
-    A[Caller invokes CreatePDF] --> B[Source pushed to input channel]
-    B --> C[Worker Goroutine Pool]
-
-    subgraph Concurrent Execution
-    C --> D[Spawn Subprocess: typst compile - -]
-    D --> E{Compile success?}
-    end
-
-    E -->|Yes| F[Send PDF bytes to OutputChan]
-    E -->|No| G[Send error to ErrorChan]
-
-    F --> H[Consumer handles PDF stream]
-    G --> I[Consumer logs/handles failure]
-    H --> J[WaitAndClose graceful shutdown]
-    I --> J
-
+    A[CreatePDF] --> B[Input channel]
+    B --> C[Worker pool]
+    C --> D[typst compile - -]
+    D --> E{Success?}
+    E -->|Yes| F[OutputChan]
+    E -->|No| G[ErrorChan]
+    F --> H[Read PDF bytes]
+    G --> I[Handle error]
 ```
 
-## Setup & Run Locally
+## Requirements
 
-### Requirements
+- Go
+- Typst CLI installed and available in `PATH`
 
-- Typst CLI installed and available in your system `PATH`.
-
-Verify installation:
+Check Typst:
 
 ```bash
 typst --version
-
 ```
 
-### Execution
+## Run Locally
 
-1. **Clone the repository and tidy dependencies:**
+Install or tidy Go dependencies:
 
 ```bash
 go mod tidy
-
 ```
 
-1. **Run the local stress test (1000 PDF generations):**
-   This simulates a heavy workload using a sample `.typ` file.
+Run the sample stress test:
 
 ```bash
 go run .
-
 ```
 
-1. **Run the CPU-bound benchmarks:**
+The sample renders `renderer/file.typ` 1000 times.
+
+Run benchmarks:
 
 ```bash
-go test -bench=. -benchmem -benchtime=10s -cpu=12 ./renderer
-
+go test -bench=. -benchmem -benchtime=10s ./renderer
 ```
 
-The benchmark runs multiple worker and buffer combinations so you can find the best values for your own hardware.
+## Basic Use
 
-## Performance & Benchmark Results
+```go
+r := renderer.New(renderer.RendererNew{
+    InputChanSize:  24,
+    OutputChanSize: 24,
+    Workers:        12,
+    ProcessTimeout: 5 * time.Second,
+})
 
-Measured on: Linux (amd64), AMD Ryzen 5 5600H with 12 CPU threads
+r.CreatePDF("# Hello from Typst")
+r.WaitAndClose()
+
+for pdf := range r.OutputChan {
+    // use pdf bytes
+}
+
+for err := range r.ErrorChan {
+    // handle render error
+}
+```
+
+In a real app, read `OutputChan` and `ErrorChan` while sending work. This keeps the channels from filling up during large runs.
+
+## Worker and Buffer Settings
+
+The sample uses:
+
+```go
+workers := runtime.NumCPU()
+bufferSize := workers * 2
+```
+
+This is a good starting point:
+
+- `workers`: number of CPU threads
+- `bufferSize`: `2x` workers
+
+More workers can help until your CPU is full. After that, extra workers usually add overhead. A much larger buffer usually just stores more queued work without making Typst compile faster.
+
+## Benchmark Result
+
+Measured on Linux amd64 with an AMD Ryzen 5 5600H, 12 CPU threads.
+
 Date: 2026-04-21
 
-### 1000-Document Stress Run
-
-This run used `12 workers` and a `24` item buffer (`2x` the worker count).
+Stress run:
 
 ```text
 Starting stress test: 1000 runs | 12 workers | 24 buffer
@@ -97,31 +123,13 @@ Success Rate     : 1000/1000
 Error Rate       : 0/1000
 Throughput       : 90.27 PDFs/sec
 =====================================
-
 ```
 
-### Choosing Worker and Buffer Values
+## Not Included
 
-The default stress-test configuration is:
+This package only renders PDFs. It does not include:
 
-```go
-workers := runtime.NumCPU()
-bufferSize := workers * 2
-```
-
-As a practical starting point, set workers equal to the number of CPU threads and keep the buffer at `2x` workers. That keeps every CPU thread busy while avoiding unnecessary queue growth.
-
-To find the best setting for another machine, run:
-
-```bash
-go test -bench=. -benchmem -benchtime=10s ./renderer
-```
-
-More workers than available CPU threads usually adds context-switching overhead, and buffers much larger than `2x` generally queue more work without improving Typst compilation throughput.
-
-## Out of Scope & Future Considerations
-
-This project focuses entirely on maximizing compilation throughput. The following features were intentionally excluded to maintain performance clarity:
-
-- **Document Lifecycle Management:** No S3 uploads, file identity, or database tracking.
-- **Network Transport:** This is an internal engine, not an HTTP/gRPC server.
+- HTTP or gRPC server code
+- S3 uploads
+- database tracking
+- file naming or document history
